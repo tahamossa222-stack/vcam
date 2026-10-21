@@ -878,10 +878,24 @@ struct Session {
     std::atomic<int> source_mode{0};
     std::atomic<SourceRenderer*> renderer{nullptr};
     std::promise<bool> ready;
+
+    // Frame staging. Owned by the session, not the renderer, so a push that
+    // races with teardown only touches the refcounted session.
+    std::mutex frame_mutex;
+    std::vector<uint8_t> rgba;
+    int rgba_w = 0;
+    int rgba_h = 0;
+    std::atomic<uint64_t> rgba_seq{0};
+    std::vector<uint8_t> nv21;
+    int nv21_w = 0;
+    int nv21_h = 0;
+    std::atomic<uint64_t> nv21_seq{0};
+    std::atomic<int> src_w{0};
+    std::atomic<int> src_h{0};
 };
 
 std::mutex g_live_mutex;
-std::unordered_set<Session*> g_live;
+std::unordered_map<Session*, std::shared_ptr<Session>> g_live;
 
 void draw_test_pattern(int width, int height, uint64_t frame) {
     glViewport(0, 0, width, height);
@@ -943,27 +957,22 @@ public:
 
     jobject video_surface() const { return video_surface_; }
 
-    void push_rgba(const uint8_t* data, int width, int height);
-    void push_nv21(const uint8_t* data, int width, int height);
-    void set_source_size(int width, int height) {
-        src_w_.store(width, std::memory_order_relaxed);
-        src_h_.store(height, std::memory_order_relaxed);
-    }
-
-    void draw(int fbo, int width, int height, int mode, uint64_t frame);
+    void draw(int fbo, int width, int height, int mode, uint64_t frame,
+              Session& source);
 
 private:
     bool build_programs(Status* st);
     GLuint compile(GLenum type, const char* source, Status* st);
     GLuint link(const char* vs, const char* fs, Status* st);
 
-    void draw_video(int fbo, int w, int h);
-    void draw_image(int fbo, int w, int h);
-    void draw_nv21(int fbo, int w, int h);
+    void draw_video(int fbo, int w, int h, Session& source);
+    void draw_image(int fbo, int w, int h, Session& source);
+    void draw_nv21(int fbo, int w, int h, Session& source);
 
-    void upload_image();
-    void upload_nv21();
-    void aspect_scale(int target_w, int target_h, float out[2]) const;
+    void upload_image(Session& source);
+    void upload_nv21(Session& source);
+    void aspect_scale(int target_w, int target_h, Session& source,
+                      float out[2]) const;
 
     JavaVM* vm_ = nullptr;
     bool attached_ = false;
@@ -1000,21 +1009,8 @@ private:
     GLuint y_tex_ = 0;
     GLuint uv_tex_ = 0;
 
-    std::mutex pending_mutex_;
-    std::vector<uint8_t> pending_rgba_;
-    int pending_rgba_w_ = 0;
-    int pending_rgba_h_ = 0;
-    std::atomic<uint64_t> rgba_seq_{0};
     uint64_t rgba_drawn_ = 0;
-
-    std::vector<uint8_t> pending_nv21_;
-    int pending_nv21_w_ = 0;
-    int pending_nv21_h_ = 0;
-    std::atomic<uint64_t> nv21_seq_{0};
     uint64_t nv21_drawn_ = 0;
-
-    std::atomic<int> src_w_{0};
-    std::atomic<int> src_h_{0};
 
     int img_w_ = 0;
     int img_h_ = 0;
@@ -1022,6 +1018,7 @@ private:
     int nv_h_ = 0;
     bool has_image_ = false;
     bool has_nv21_ = false;
+    bool have_video_frame_ = false;
 };
 
 namespace {
@@ -1303,12 +1300,13 @@ GLuint SourceRenderer::link(const char* vs, const char* fs, Status* st) {
     return prog;
 }
 
-void SourceRenderer::aspect_scale(int target_w, int target_h, float out[2]) const {
+void SourceRenderer::aspect_scale(int target_w, int target_h, Session& source,
+                                  float out[2]) const {
     out[0] = 1.0f;
     out[1] = 1.0f;
 
-    const int sw = src_w_.load(std::memory_order_relaxed);
-    const int sh = src_h_.load(std::memory_order_relaxed);
+    const int sw = source.src_w.load(std::memory_order_relaxed);
+    const int sh = source.src_h.load(std::memory_order_relaxed);
     if (sw <= 0 || sh <= 0 || target_w <= 0 || target_h <= 0) return;
 
     const float source_aspect = static_cast<float>(sw) / static_cast<float>(sh);
@@ -1322,40 +1320,15 @@ void SourceRenderer::aspect_scale(int target_w, int target_h, float out[2]) cons
     }
 }
 
-void SourceRenderer::push_rgba(const uint8_t* data, int width, int height) {
-    if (data == nullptr || width <= 0 || height <= 0) return;
-    const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;
+void SourceRenderer::upload_image(Session& source) {
+    if (source.rgba_seq.load(std::memory_order_acquire) == rgba_drawn_) return;
 
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_rgba_.size() != bytes) pending_rgba_.resize(bytes);
-    std::memcpy(pending_rgba_.data(), data, bytes);
-    pending_rgba_w_ = width;
-    pending_rgba_h_ = height;
-    rgba_seq_.fetch_add(1, std::memory_order_release);
-}
+    std::lock_guard<std::mutex> lock(source.frame_mutex);
+    if (source.rgba.empty()) return;
 
-void SourceRenderer::push_nv21(const uint8_t* data, int width, int height) {
-    if (data == nullptr || width <= 0 || height <= 0) return;
-    const std::size_t bytes =
-        static_cast<std::size_t>(width) * height + static_cast<std::size_t>(width) * height / 2;
-
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_nv21_.size() != bytes) pending_nv21_.resize(bytes);
-    std::memcpy(pending_nv21_.data(), data, bytes);
-    pending_nv21_w_ = width;
-    pending_nv21_h_ = height;
-    nv21_seq_.fetch_add(1, std::memory_order_release);
-}
-
-void SourceRenderer::upload_image() {
-    if (rgba_seq_.load(std::memory_order_acquire) == rgba_drawn_) return;
-
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_rgba_.empty()) return;
-
-    if (!has_image_ || img_w_ != pending_rgba_w_ || img_h_ != pending_rgba_h_) {
-        img_w_ = pending_rgba_w_;
-        img_h_ = pending_rgba_h_;
+    if (!has_image_ || img_w_ != source.rgba_w || img_h_ != source.rgba_h) {
+        img_w_ = source.rgba_w;
+        img_h_ = source.rgba_h;
         glBindTexture(GL_TEXTURE_2D, img_tex_);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1369,18 +1342,18 @@ void SourceRenderer::upload_image() {
     glBindTexture(GL_TEXTURE_2D, img_tex_);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img_w_, img_h_,
-                    GL_RGBA, GL_UNSIGNED_BYTE, pending_rgba_.data());
-    rgba_drawn_ = rgba_seq_.load(std::memory_order_acquire);
+                    GL_RGBA, GL_UNSIGNED_BYTE, source.rgba.data());
+    rgba_drawn_ = source.rgba_seq.load(std::memory_order_acquire);
 }
 
-void SourceRenderer::upload_nv21() {
-    if (nv21_seq_.load(std::memory_order_acquire) == nv21_drawn_) return;
+void SourceRenderer::upload_nv21(Session& source) {
+    if (source.nv21_seq.load(std::memory_order_acquire) == nv21_drawn_) return;
 
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_nv21_.empty()) return;
+    std::lock_guard<std::mutex> lock(source.frame_mutex);
+    if (source.nv21.empty()) return;
 
-    const int w = pending_nv21_w_;
-    const int h = pending_nv21_h_;
+    const int w = source.nv21_w;
+    const int h = source.nv21_h;
 
     if (!has_nv21_ || nv_w_ != w || nv_h_ != h) {
         nv_w_ = w;
@@ -1407,16 +1380,16 @@ void SourceRenderer::upload_nv21() {
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glBindTexture(GL_TEXTURE_2D, y_tex_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
-                    GL_RED, GL_UNSIGNED_BYTE, pending_nv21_.data());
+                    GL_RED, GL_UNSIGNED_BYTE, source.nv21.data());
 
     glBindTexture(GL_TEXTURE_2D, uv_tex_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w / 2, h / 2,
-                    GL_RG, GL_UNSIGNED_BYTE, pending_nv21_.data() + w * h);
+                    GL_RG, GL_UNSIGNED_BYTE, source.nv21.data() + w * h);
 
-    nv21_drawn_ = nv21_seq_.load(std::memory_order_acquire);
+    nv21_drawn_ = source.nv21_seq.load(std::memory_order_acquire);
 }
 
-void SourceRenderer::draw_video(int fbo, int w, int h) {
+void SourceRenderer::draw_video(int fbo, int w, int h, Session& source) {
     if (env_ == nullptr || surface_texture_ == nullptr || prog_ext_ == 0 ||
         update_tex_ == nullptr || get_transform_ == nullptr || transform_array_ == nullptr) {
         draw_test_pattern(w, h, 0);
@@ -1425,7 +1398,12 @@ void SourceRenderer::draw_video(int fbo, int w, int h) {
 
     env_->CallVoidMethod(surface_texture_, update_tex_);
     const bool fresh = env_->ExceptionCheck() == JNI_FALSE;
-    if (!fresh) env_->ExceptionClear();
+    if (!fresh) {
+        env_->ExceptionClear();
+    } else if (!have_video_frame_) {
+        have_video_frame_ = true;
+        LOGI("video frame latched");
+    }
 
     env_->CallVoidMethod(surface_texture_, get_transform_, transform_array_);
     if (env_->ExceptionCheck() != JNI_FALSE) {
@@ -1435,7 +1413,7 @@ void SourceRenderer::draw_video(int fbo, int w, int h) {
     }
 
     float scale[2];
-    aspect_scale(w, h, scale);
+    aspect_scale(w, h, source, scale);
 
     glUseProgram(prog_ext_);
     glUniform1i(u_ext_tex_, 0);
@@ -1446,15 +1424,15 @@ void SourceRenderer::draw_video(int fbo, int w, int h) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void SourceRenderer::draw_image(int fbo, int w, int h) {
-    upload_image();
+void SourceRenderer::draw_image(int fbo, int w, int h, Session& source) {
+    upload_image(source);
     if (!has_image_ || prog_img_ == 0) {
         draw_test_pattern(w, h, 0);
         return;
     }
 
     float scale[2];
-    aspect_scale(w, h, scale);
+    aspect_scale(w, h, source, scale);
 
     glUseProgram(prog_img_);
     glUniform1i(u_img_tex_, 0);
@@ -1465,15 +1443,15 @@ void SourceRenderer::draw_image(int fbo, int w, int h) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
-void SourceRenderer::draw_nv21(int fbo, int w, int h) {
-    upload_nv21();
+void SourceRenderer::draw_nv21(int fbo, int w, int h, Session& source) {
+    upload_nv21(source);
     if (!has_nv21_ || prog_nv21_ == 0) {
         draw_test_pattern(w, h, 0);
         return;
     }
 
     float scale[2];
-    aspect_scale(w, h, scale);
+    aspect_scale(w, h, source, scale);
 
     glUseProgram(prog_nv21_);
     glUniform1i(u_nv_y_, 0);
@@ -1489,7 +1467,8 @@ void SourceRenderer::draw_nv21(int fbo, int w, int h) {
     glActiveTexture(GL_TEXTURE0);
 }
 
-void SourceRenderer::draw(int fbo, int width, int height, int mode, uint64_t frame) {
+void SourceRenderer::draw(int fbo, int width, int height, int mode, uint64_t frame,
+                          Session& source) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glViewport(0, 0, width, height);
     glDisable(GL_BLEND);
@@ -1499,9 +1478,9 @@ void SourceRenderer::draw(int fbo, int width, int height, int mode, uint64_t fra
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     switch (mode) {
-        case kVideo: draw_video(fbo, width, height); break;
-        case kImage: draw_image(fbo, width, height); break;
-        case kNv21: draw_nv21(fbo, width, height); break;
+        case kVideo: draw_video(fbo, width, height, source); break;
+        case kImage: draw_image(fbo, width, height, source); break;
+        case kNv21: draw_nv21(fbo, width, height, source); break;
         default: draw_test_pattern(width, height, frame); break;
     }
 
@@ -1584,7 +1563,7 @@ void worker_main(Session* s) {
             s->dropped.fetch_add(1, std::memory_order_relaxed);
         } else {
             const int mode = s->source_mode.load(std::memory_order_relaxed);
-            source.draw(slot.fbo(), s->width, s->height, mode, frame);
+            source.draw(slot.fbo(), s->width, s->height, mode, frame, *s);
             slot.set_pts_ns(now_boottime_ns());
 
             const Status presented = sink->present(slot);
@@ -1618,15 +1597,17 @@ void worker_main(Session* s) {
     egl.reset();
 }
 
-bool is_live(Session* s) {
-    std::lock_guard<std::mutex> lock(g_live_mutex);
-    return g_live.count(s) != 0;
-}
-
-Session* from_handle(jlong handle) {
+// Returns a strong reference so an in-flight call keeps the session alive if
+// destroySession runs concurrently. The registry entry is removed first, so no
+// new call can acquire the session once teardown starts.
+std::shared_ptr<Session> from_handle(jlong handle) {
     if (handle == 0) return nullptr;
     auto* s = reinterpret_cast<Session*>(static_cast<intptr_t>(handle));
-    return is_live(s) ? s : nullptr;
+
+    std::lock_guard<std::mutex> lock(g_live_mutex);
+    auto it = g_live.find(s);
+    if (it == g_live.end()) return nullptr;
+    return it->second;
 }
 
 // ---- JNI entry points ------------------------------------------------------
@@ -1641,7 +1622,7 @@ jlong j_create_session(JNIEnv* env, jclass, jobject surface, jint width, jint he
         return 0;
     }
 
-    std::unique_ptr<Session> s(new Session());
+    std::shared_ptr<Session> s = std::make_shared<Session>();
     s->window = window;
     s->width = width;
     s->height = height;
@@ -1666,34 +1647,40 @@ jlong j_create_session(JNIEnv* env, jclass, jobject surface, jint width, jint he
         return 0;
     }
 
-    Session* raw = s.release();
+    Session* raw = s.get();
     {
         std::lock_guard<std::mutex> lock(g_live_mutex);
-        g_live.insert(raw);
+        g_live.emplace(raw, std::move(s));
     }
     LOGI("session created %dx%d handle=%p", width, height, static_cast<void*>(raw));
     return static_cast<jlong>(reinterpret_cast<intptr_t>(raw));
 }
 
 void j_destroy_session(JNIEnv*, jclass, jlong handle) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return;
+    if (handle == 0) return;
+    auto* raw = reinterpret_cast<Session*>(static_cast<intptr_t>(handle));
+
+    std::shared_ptr<Session> s;
+    {
+        std::lock_guard<std::mutex> lock(g_live_mutex);
+        auto it = g_live.find(raw);
+        if (it == g_live.end()) return;
+        s = std::move(it->second);
+        g_live.erase(it);
+    }
 
     s->running.store(false, std::memory_order_relaxed);
     if (s->worker.joinable()) s->worker.join();
-    if (s->window != nullptr) ANativeWindow_release(s->window);
-
-    {
-        std::lock_guard<std::mutex> lock(g_live_mutex);
-        g_live.erase(s);
+    if (s->window != nullptr) {
+        ANativeWindow_release(s->window);
+        s->window = nullptr;
     }
-    LOGI("session destroyed handle=%p", static_cast<void*>(s));
-    delete s;
+    LOGI("session destroyed handle=%p", static_cast<void*>(raw));
 }
 
 void j_set_active(JNIEnv*, jclass, jlong handle, jboolean active) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return;
+    auto s = from_handle(handle);
+    if (!s) return;
     s->active.store(active == JNI_TRUE, std::memory_order_relaxed);
 }
 
@@ -1715,8 +1702,8 @@ jintArray j_surface_size(JNIEnv* env, jclass, jobject surface) {
 }
 
 jlongArray j_stats(JNIEnv* env, jclass, jlong handle) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return nullptr;
+    auto s = from_handle(handle);
+    if (!s) return nullptr;
 
     const jlong values[3] = {
         static_cast<jlong>(s->presented.load(std::memory_order_relaxed)),
@@ -1729,14 +1716,14 @@ jlongArray j_stats(JNIEnv* env, jclass, jlong handle) {
 }
 
 void j_set_fps(JNIEnv*, jclass, jlong handle, jint fps) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return;
+    auto s = from_handle(handle);
+    if (!s) return;
     s->fps.store(std::clamp<int>(fps, 1, kMaxFps), std::memory_order_relaxed);
 }
 
 jobject j_video_surface(JNIEnv* env, jclass, jlong handle) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return nullptr;
+    auto s = from_handle(handle);
+    if (!s) return nullptr;
 
     SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
     if (r == nullptr) return nullptr;
@@ -1746,53 +1733,56 @@ jobject j_video_surface(JNIEnv* env, jclass, jlong handle) {
 }
 
 void j_set_source(JNIEnv*, jclass, jlong handle, jint mode) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return;
+    auto s = from_handle(handle);
+    if (!s) return;
     s->source_mode.store(std::clamp<int>(mode, 0, 3), std::memory_order_relaxed);
 }
 
 void j_set_source_size(JNIEnv*, jclass, jlong handle, jint width, jint height) {
-    Session* s = from_handle(handle);
-    if (s == nullptr) return;
-
-    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
-    if (r == nullptr) return;
-
-    r->set_source_size(width, height);
+    auto s = from_handle(handle);
+    if (!s) return;
+    s->src_w.store(width, std::memory_order_relaxed);
+    s->src_h.store(height, std::memory_order_relaxed);
 }
 
 void j_push_image(JNIEnv* env, jclass, jlong handle, jobject buffer, jint width, jint height) {
-    Session* s = from_handle(handle);
-    if (s == nullptr || buffer == nullptr) return;
+    auto s = from_handle(handle);
+    if (!s || buffer == nullptr) return;
 
     const jlong capacity = env->GetDirectBufferCapacity(buffer);
     const jlong required = static_cast<jlong>(width) * height * 4;
     if (capacity < required || required <= 0) return;
 
-    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
-    if (r == nullptr) return;
-
     auto* data = static_cast<const uint8_t*>(env->GetDirectBufferAddress(buffer));
     if (data == nullptr) return;
 
-    r->push_rgba(data, width, height);
+    const std::size_t bytes = static_cast<std::size_t>(required);
+    std::lock_guard<std::mutex> lock(s->frame_mutex);
+    if (s->rgba.size() != bytes) s->rgba.resize(bytes);
+    std::memcpy(s->rgba.data(), data, bytes);
+    s->rgba_w = width;
+    s->rgba_h = height;
+    s->rgba_seq.fetch_add(1, std::memory_order_release);
 }
 
 void j_push_nv21(JNIEnv* env, jclass, jlong handle, jobject buffer, jint width, jint height) {
-    Session* s = from_handle(handle);
-    if (s == nullptr || buffer == nullptr) return;
+    auto s = from_handle(handle);
+    if (!s || buffer == nullptr) return;
 
     const jlong capacity = env->GetDirectBufferCapacity(buffer);
     const jlong required = static_cast<jlong>(width) * height * 3 / 2;
     if (capacity < required || required <= 0) return;
 
-    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
-    if (r == nullptr) return;
-
     auto* data = static_cast<const uint8_t*>(env->GetDirectBufferAddress(buffer));
     if (data == nullptr) return;
 
-    r->push_nv21(data, width, height);
+    const std::size_t bytes = static_cast<std::size_t>(required);
+    std::lock_guard<std::mutex> lock(s->frame_mutex);
+    if (s->nv21.size() != bytes) s->nv21.resize(bytes);
+    std::memcpy(s->nv21.data(), data, bytes);
+    s->nv21_w = width;
+    s->nv21_h = height;
+    s->nv21_seq.fetch_add(1, std::memory_order_release);
 }
 
 const JNINativeMethod kMethods[] = {
