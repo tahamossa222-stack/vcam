@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- Initial scope; LSPosed Manager scope selection overrides this list. -->
-    <string-array name="xposed_scope">
-        <item>com.android.camera2</item>
-        <item>com.google.android.GoogleCamera</item>
-        <item>com.android.camera</item>
-    </string-array>
-</resources>

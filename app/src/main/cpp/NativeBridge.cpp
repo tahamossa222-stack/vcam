@@ -846,7 +846,7 @@ using vcam::Status;
 using vcam::SurfaceSink;
 using vcam::YuvMatrix;
 
-constexpr const char* kBridgeClass = "com/vcam/hook/NativeBridge";
+constexpr const char* kBridgeClass = "com/vcam/core/NativeBridge";
 constexpr int kDefaultFps = 30;
 constexpr int kMaxFps = 120;
 constexpr int kIdleSleepMs = 5;

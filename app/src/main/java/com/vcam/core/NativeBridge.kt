@@ -1,5 +1,5 @@
 // language: Kotlin, file: NativeBridge.kt, target: NDK r28+
-package com.vcam.hook
+package com.vcam.core
 
 import android.view.Surface
 
