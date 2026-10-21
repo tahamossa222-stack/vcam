@@ -56,9 +56,9 @@ class GuestClassLoader private constructor(
         }
 
         /**
-         * Copies lib/<abi>/*.so out of the guest APK. Guests without native
-         * code, or with an ABI this device does not support, load fine; their
-         * native calls simply fail at use time.
+         * Copies shared objects under lib/<abi>/ out of the guest APK. Guests
+         * without native code, or with an ABI this device does not support,
+         * load fine; their native calls simply fail at use time.
          */
         private fun extractNativeLibraries(apk: File, out: File) {
             runCatching {
