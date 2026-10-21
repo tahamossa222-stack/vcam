@@ -19,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -255,10 +256,10 @@ public:
         uint32_t width = 1920;
         uint32_t height = 1080;
         uint32_t capacity = 4;
-        uint32_t format = AHARDWARE_BUFFER_FORMAT_R8G8B8A8_UNORM;
-        uint64_t usage = AHARDWARE_BUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                         AHARDWARE_BUFFER_USAGE_GPU_FRAMEBUFFER |
-                         AHARDWARE_BUFFER_USAGE_VIDEO_ENCODE;
+        uint32_t format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        uint64_t usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                         AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                         AHARDWAREBUFFER_USAGE_VIDEO_ENCODE;
         std::chrono::milliseconds acquire_timeout{16};
     };
 
@@ -547,6 +548,13 @@ void BufferRing::Lease::set_pts_ns(int64_t pts) const {
 
 // ===========================================================================
 // SurfaceSink
+//
+// The public NDK exposes no BufferQueue dequeue/queue entry points, so the
+// sink drives the consumer's queue through an EGLSurface: eglSwapBuffers
+// performs dequeue, presentation and queue internally, including fence
+// handoff. The ring texture remains the source, so the composition side is
+// unchanged. If the consumer's buffers cannot back an EGLSurface, creation
+// fails loudly here and the slot is never armed.
 // ===========================================================================
 
 enum class YuvMatrix : int { kBt601 = 0, kBt709 = 1, kBt2020 = 2 };
@@ -556,8 +564,6 @@ public:
     struct Config {
         YuvMatrix matrix = YuvMatrix::kBt709;
         bool limited_range = true;
-        std::chrono::milliseconds dequeue_timeout{16};
-        bool allow_window_fallback = true;
     };
 
     struct Stats {
@@ -577,31 +583,14 @@ public:
     const Stats& stats() const { return stats_; }
 
 private:
-    enum class Mode : uint8_t { kImageBlit, kWindowSurface };
-
-    struct Target {
-        EGLImageKHR image = EGL_NO_IMAGE_KHR;
-        GLuint texture = 0;
-        GLuint fbo = 0;
-        int32_t width = 0;
-        int32_t height = 0;
-        int32_t stride = 0;
-    };
-
     SurfaceSink() = default;
 
     bool init(EglCore* egl, Status* st);
-    bool build_programs(Status* st);
+    bool build_program(Status* st);
     GLuint compile(GLenum type, const char* source, Status* st);
     GLuint link(const char* vs, const char* fs, Status* st);
     void destroy();
-
-    Status wait_fence(int fence_fd);
-    Status draw(GLuint target_fbo, GLuint src_tex, int32_t w, int32_t h, bool yuv_target);
-    Status present_image(const BufferRing::Lease& src);
-    Status present_window(const BufferRing::Lease& src);
-    Target* resolve_target(ANativeWindowBuffer* buffer, Status* st);
-    void destroy_target(Target& target);
+    Status draw(GLuint src_tex);
 
     Config cfg_{};
     EglCore* egl_ = nullptr;
@@ -609,17 +598,7 @@ private:
     EGLSurface egl_surface_ = EGL_NO_SURFACE;
 
     GLuint prog_rgba_ = 0;
-    GLuint prog_yuv_ = 0;
     GLint u_rgba_src_ = -1;
-    GLint u_yuv_src_ = -1;
-    GLint u_yuv_matrix_ = -1;
-    GLint u_yuv_offset_ = -1;
-    GLint u_yuv_scale_ = -1;
-
-    Mode mode_ = Mode::kImageBlit;
-    bool yuv_native_ = false;
-    bool window_failed_ = false;
-    std::unordered_map<ANativeWindowBuffer*, Target> targets_{};
 
     int32_t width_ = 0;
     int32_t height_ = 0;
@@ -627,9 +606,6 @@ private:
 };
 
 namespace {
-
-constexpr int32_t kFormatYcbcr420888 = 0x23;
-constexpr int32_t kFormatYv12 = 0x32315659;
 
 constexpr char kVertexShader[] = R"glsl(
 #version 300 es
@@ -652,73 +628,10 @@ void main() {
 }
 )glsl";
 
-constexpr char kFragmentYuv[] = R"glsl(
-#version 300 es
-#extension GL_EXT_YUV_target : require
-precision mediump float;
-uniform sampler2D u_src;
-uniform mat3 u_rgb2yuv;
-uniform vec3 u_offset;
-uniform vec3 u_scale;
-in vec2 v_uv;
-layout(yuv) out vec4 out_yuv;
-void main() {
-    vec3 rgb = texture(u_src, v_uv).rgb;
-    out_yuv = vec4(clamp(u_rgb2yuv * rgb * u_scale + u_offset, 0.0, 1.0), 1.0);
-}
-)glsl";
-
-struct YuvConstants {
-    GLfloat rgb2yuv[9];
-    GLfloat offset[3];
-    GLfloat scale[3];
-};
-
-YuvConstants make_yuv_constants(YuvMatrix matrix, bool limited) {
-    const GLfloat y_lo = limited ? 16.0f / 255.0f : 0.0f;
-    const GLfloat c_mid = 128.0f / 255.0f;
-    const GLfloat y_range = limited ? 219.0f / 255.0f : 1.0f;
-    const GLfloat c_range = limited ? 224.0f / 255.0f : 1.0f;
-
-    YuvConstants out{};
-    out.offset[0] = y_lo;
-    out.offset[1] = c_mid;
-    out.offset[2] = c_mid;
-    out.scale[0] = y_range;
-    out.scale[1] = c_range;
-    out.scale[2] = c_range;
-
-    switch (matrix) {
-        case YuvMatrix::kBt601:
-            out.rgb2yuv[0] = 0.2990f; out.rgb2yuv[1] = 0.5870f; out.rgb2yuv[2] = 0.1140f;
-            out.rgb2yuv[3] = -0.1687f; out.rgb2yuv[4] = -0.3313f; out.rgb2yuv[5] = 0.5000f;
-            out.rgb2yuv[6] = 0.5000f; out.rgb2yuv[7] = -0.4187f; out.rgb2yuv[8] = -0.0813f;
-            break;
-        case YuvMatrix::kBt2020:
-            out.rgb2yuv[0] = 0.2627f; out.rgb2yuv[1] = 0.6780f; out.rgb2yuv[2] = 0.0593f;
-            out.rgb2yuv[3] = -0.1396f; out.rgb2yuv[4] = -0.3604f; out.rgb2yuv[5] = 0.5000f;
-            out.rgb2yuv[6] = 0.5000f; out.rgb2yuv[7] = -0.4598f; out.rgb2yuv[8] = -0.0402f;
-            break;
-        case YuvMatrix::kBt709:
-        default:
-            out.rgb2yuv[0] = 0.2126f; out.rgb2yuv[1] = 0.7152f; out.rgb2yuv[2] = 0.0722f;
-            out.rgb2yuv[3] = -0.1146f; out.rgb2yuv[4] = -0.3854f; out.rgb2yuv[5] = 0.5000f;
-            out.rgb2yuv[6] = 0.5000f; out.rgb2yuv[7] = -0.4542f; out.rgb2yuv[8] = -0.0458f;
-            break;
-    }
-    return out;
-}
-
-const char* gl_error_name(GLenum err) {
-    switch (err) {
-        case GL_NO_ERROR: return "GL_NO_ERROR";
-        case GL_INVALID_ENUM: return "GL_INVALID_ENUM";
-        case GL_INVALID_VALUE: return "GL_INVALID_VALUE";
-        case GL_INVALID_OPERATION: return "GL_INVALID_OPERATION";
-        case GL_OUT_OF_MEMORY: return "GL_OUT_OF_MEMORY";
-        case GL_INVALID_FRAMEBUFFER_OPERATION: return "GL_INVALID_FRAMEBUFFER_OPERATION";
-        default: return "GL_UNKNOWN";
-    }
+std::string hex32(uint32_t value) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "0x%08x", value);
+    return std::string(buf);
 }
 
 }  // namespace
@@ -740,8 +653,7 @@ std::unique_ptr<SurfaceSink> SurfaceSink::create(ANativeWindow* window, EglCore*
     sink->window_ = window;
 
     if (!sink->init(egl, st)) {
-        ANativeWindow_release(sink->window_);
-        sink->window_ = nullptr;
+        sink->destroy();
         return nullptr;
     }
     return sink;
@@ -756,14 +668,28 @@ bool SurfaceSink::init(EglCore* egl, Status* st) {
         return false;
     }
 
-    yuv_native_ = egl_->has_extension("GL_EXT_YUV_target");
-    if (!build_programs(st)) return false;
+    if (!build_program(st)) return false;
 
-    LOGI("sink ready %dx%d yuv_native=%d", width_, height_, yuv_native_ ? 1 : 0);
+    const EGLint attribs[] = {
+        EGL_SWAP_BEHAVIOR, EGL_BUFFER_DESTROYED,
+        EGL_NONE,
+    };
+    egl_surface_ = eglCreateWindowSurface(egl_->display(), egl_->config(), window_, attribs);
+    if (egl_surface_ == EGL_NO_SURFACE) {
+        *st = Status::fail("eglCreateWindowSurface failed " +
+                           hex32(static_cast<uint32_t>(eglGetError())));
+        return false;
+    }
+
+    const EGLContext ctx = eglGetCurrentContext();
+    if (!egl_->make_current(egl_surface_, ctx, st)) return false;
+
+    LOGI("sink ready %dx%d surface=%p", width_, height_,
+         reinterpret_cast<void*>(egl_surface_));
     return true;
 }
 
-bool SurfaceSink::build_programs(Status* st) {
+bool SurfaceSink::build_program(Status* st) {
     prog_rgba_ = link(kVertexShader, kFragmentRgba, st);
     if (prog_rgba_ == 0) return false;
 
@@ -774,27 +700,6 @@ bool SurfaceSink::build_programs(Status* st) {
     }
     glUseProgram(prog_rgba_);
     glUniform1i(u_rgba_src_, 0);
-    glUseProgram(0);
-
-    Status yuv_status{};
-    prog_yuv_ = link(kVertexShader, kFragmentYuv, &yuv_status);
-    if (prog_yuv_ == 0) {
-        yuv_native_ = false;
-        LOGI("YUV program unavailable: %s", yuv_status.message.c_str());
-        return true;
-    }
-
-    u_yuv_src_ = glGetUniformLocation(prog_yuv_, "u_src");
-    u_yuv_matrix_ = glGetUniformLocation(prog_yuv_, "u_rgb2yuv");
-    u_yuv_offset_ = glGetUniformLocation(prog_yuv_, "u_offset");
-    u_yuv_scale_ = glGetUniformLocation(prog_yuv_, "u_scale");
-
-    const YuvConstants c = make_yuv_constants(cfg_.matrix, cfg_.limited_range);
-    glUseProgram(prog_yuv_);
-    glUniformMatrix3fv(u_yuv_matrix_, 1, GL_FALSE, c.rgb2yuv);
-    glUniform3fv(u_yuv_offset_, 1, c.offset);
-    glUniform3fv(u_yuv_scale_, 1, c.scale);
-    glUniform1i(u_yuv_src_, 0);
     glUseProgram(0);
     return true;
 }
@@ -860,16 +765,10 @@ GLuint SurfaceSink::link(const char* vs_source, const char* fs_source, Status* s
 SurfaceSink::~SurfaceSink() { destroy(); }
 
 void SurfaceSink::destroy() {
-    if (eglGetCurrentContext() != EGL_NO_CONTEXT) {
-        for (auto& entry : targets_) {
-            destroy_target(entry.second);
-        }
-        if (prog_rgba_ != 0) glDeleteProgram(prog_rgba_);
-        if (prog_yuv_ != 0) glDeleteProgram(prog_yuv_);
+    if (eglGetCurrentContext() != EGL_NO_CONTEXT && prog_rgba_ != 0) {
+        glDeleteProgram(prog_rgba_);
     }
-    targets_.clear();
     prog_rgba_ = 0;
-    prog_yuv_ = 0;
 
     if (egl_surface_ != EGL_NO_SURFACE && egl_ != nullptr) {
         eglDestroySurface(egl_->display(), egl_surface_);
@@ -881,117 +780,14 @@ void SurfaceSink::destroy() {
     }
 }
 
-void SurfaceSink::destroy_target(Target& target) {
-    if (target.fbo != 0) glDeleteFramebuffers(1, &target.fbo);
-    if (target.texture != 0) glDeleteTextures(1, &target.texture);
-    if (target.image != EGL_NO_IMAGE_KHR && egl_ != nullptr) {
-        egl_->procs().destroy_image(egl_->display(), target.image);
-    }
-    target = Target{};
-}
+Status SurfaceSink::draw(GLuint src_tex) {
+    if (src_tex == 0) return Status::fail("draw: null source texture");
 
-Status SurfaceSink::wait_fence(int fence_fd) {
-    if (fence_fd < 0) return Status::success();
+    glUseProgram(prog_rgba_);
+    glUniform1i(u_rgba_src_, 0);
 
-    const EGLint attribs[] = {
-        EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fence_fd,
-        EGL_NONE,
-    };
-    const EglProcs& procs = egl_->procs();
-    const EGLDisplay dpy = egl_->display();
-
-    // Creation consumes the fd; do not close it afterwards.
-    EGLSyncKHR sync = procs.create_sync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
-    if (sync == EGL_NO_SYNC_KHR) {
-        ::close(fence_fd);
-        return Status::drop("eglCreateSyncKHR(fence) failed");
-    }
-
-    if (procs.wait_sync != nullptr) {
-        procs.wait_sync(dpy, sync, 0);
-    } else if (procs.client_wait_sync != nullptr) {
-        procs.client_wait_sync(dpy, sync, EGL_FOREVER_KHR, nullptr);
-    }
-    procs.destroy_sync(dpy, sync);
-    return Status::success();
-}
-
-SurfaceSink::Target* SurfaceSink::resolve_target(ANativeWindowBuffer* buffer, Status* st) {
-    auto it = targets_.find(buffer);
-    if (it != targets_.end()) {
-        Target& existing = it->second;
-        if (existing.width == buffer->width &&
-            existing.height == buffer->height &&
-            existing.stride == static_cast<int32_t>(buffer->stride)) {
-            return &existing;
-        }
-        destroy_target(existing);
-        targets_.erase(it);
-    }
-
-    const EglProcs& procs = egl_->procs();
-    const EGLDisplay dpy = egl_->display();
-
-    Target target{};
-    target.image = procs.create_image(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
-                                      reinterpret_cast<EGLClientBuffer>(buffer), nullptr);
-    if (target.image == EGL_NO_IMAGE_KHR) {
-        *st = Status::drop("eglCreateImageKHR(window buffer) failed");
-        return nullptr;
-    }
-
-    glGenTextures(1, &target.texture);
-    glBindTexture(GL_TEXTURE_2D, target.texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, target.image);
-
-    if (const GLenum err = glGetError(); err != GL_NO_ERROR) {
-        destroy_target(target);
-        *st = Status::drop(std::string("glEGLImageTargetTexture2DOES(window): ") +
-                           gl_error_name(err));
-        return nullptr;
-    }
-
-    glGenFramebuffers(1, &target.fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           target.texture, 0);
-    const GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (fb_status != GL_FRAMEBUFFER_COMPLETE) {
-        destroy_target(target);
-        *st = Status::drop("window framebuffer incomplete: 0x" +
-                           std::to_string(fb_status));
-        return nullptr;
-    }
-
-    target.width = buffer->width;
-    target.height = buffer->height;
-    target.stride = static_cast<int32_t>(buffer->stride);
-
-    auto inserted = targets_.emplace(buffer, target);
-    return &inserted.first->second;
-}
-
-Status SurfaceSink::draw(GLuint target_fbo, GLuint src_tex, int32_t w, int32_t h,
-                         bool yuv_target) {
-    if (w <= 0 || h <= 0) return Status::fail("draw: zero target geometry");
-
-    if (yuv_target) {
-        if (prog_yuv_ == 0) {
-            return Status::fail("YUV target requested without GL_EXT_YUV_target");
-        }
-        glUseProgram(prog_yuv_);
-    } else {
-        glUseProgram(prog_rgba_);
-        glUniform1i(u_rgba_src_, 0);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
-    glViewport(0, 0, w, h);
+    glViewport(0, 0, width_, height_);
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
@@ -1003,107 +799,10 @@ Status SurfaceSink::draw(GLuint target_fbo, GLuint src_tex, int32_t w, int32_t h
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     const GLenum err = glGetError();
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (err != GL_NO_ERROR) {
-        return Status::fail(std::string("draw failed: ") + gl_error_name(err));
+        return Status::fail("blit failed " + hex32(static_cast<uint32_t>(err)));
     }
     return Status::success();
-}
-
-Status SurfaceSink::present_image(const BufferRing::Lease& src) {
-    ANativeWindowBuffer* buffer = nullptr;
-    int fence_fd = -1;
-
-    const int rc = ANativeWindow_dequeueBuffer(window_, &buffer, &fence_fd);
-    if (rc != 0 || buffer == nullptr) {
-        ++stats_.dropped;
-        return Status::drop("dequeueBuffer failed rc=" + std::to_string(rc));
-    }
-
-    Status st = wait_fence(fence_fd);
-    if (!st) {
-        ANativeWindow_cancelBuffer(window_, buffer, -1);
-        ++stats_.dropped;
-        return st;
-    }
-
-    Target* target = resolve_target(buffer, &st);
-    if (target == nullptr) {
-        ANativeWindow_cancelBuffer(window_, buffer, -1);
-        ++stats_.dropped;
-        return st;
-    }
-
-    const bool yuv_target = (buffer->format == kFormatYcbcr420888 ||
-                             buffer->format == kFormatYv12);
-
-    st = draw(target->fbo, src.texture(), target->width, target->height, yuv_target);
-    if (!st) {
-        ANativeWindow_cancelBuffer(window_, buffer, -1);
-        ++stats_.errors;
-        return st;
-    }
-
-    const EglProcs& procs = egl_->procs();
-    const EGLDisplay dpy = egl_->display();
-
-    // Sync object first, flush, then dup: the fd then covers all submitted work.
-    EGLSyncKHR sync = procs.create_sync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
-    if (sync == EGL_NO_SYNC_KHR) {
-        ANativeWindow_cancelBuffer(window_, buffer, -1);
-        ++stats_.errors;
-        return Status::fail("eglCreateSyncKHR(native fence) failed");
-    }
-    glFlush();
-    const int out_fence = procs.dup_native_fence_fd(dpy, sync);
-    procs.destroy_sync(dpy, sync);
-
-    if (ANativeWindow_queueBuffer(window_, buffer, out_fence) != 0) {
-        if (out_fence >= 0) ::close(out_fence);
-        ANativeWindow_cancelBuffer(window_, buffer, -1);
-        ++stats_.errors;
-        return Status::drop("queueBuffer failed");
-    }
-
-    ++stats_.presented;
-    return Status::success();
-}
-
-Status SurfaceSink::present_window(const BufferRing::Lease& src) {
-    const EGLDisplay dpy = egl_->display();
-
-    if (egl_surface_ == EGL_NO_SURFACE) {
-        egl_surface_ = eglCreateWindowSurface(dpy, egl_->config(), window_, nullptr);
-        if (egl_surface_ == EGL_NO_SURFACE) {
-            window_failed_ = true;
-            return Status::fail("eglCreateWindowSurface failed");
-        }
-    }
-
-    const EGLContext prev_ctx = eglGetCurrentContext();
-    const EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
-
-    Status st{};
-    if (!egl_->make_current(egl_surface_, prev_ctx, &st)) {
-        ++stats_.errors;
-        return st;
-    }
-
-    st = draw(0, src.texture(), ANativeWindow_getWidth(window_),
-              ANativeWindow_getHeight(window_), false);
-    if (!st) {
-        ++stats_.errors;
-    } else if (eglSwapBuffers(dpy, egl_surface_) != EGL_TRUE) {
-        st = Status::drop("eglSwapBuffers failed");
-        ++stats_.dropped;
-    } else {
-        ++stats_.presented;
-    }
-
-    EGLSurface restore = (prev_draw != EGL_NO_SURFACE) ? prev_draw
-                                                       : egl_->scratch_surface(&st);
-    egl_->make_current(restore, prev_ctx, &st);
-    return st;
 }
 
 Status SurfaceSink::present(const BufferRing::Lease& src) {
@@ -1111,24 +810,24 @@ Status SurfaceSink::present(const BufferRing::Lease& src) {
     if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
         return Status::fail("present: no current EGL context on this thread");
     }
-    if (window_failed_) return Status::fail("present: sink permanently failed");
-
-    if (mode_ == Mode::kWindowSurface) {
-        return present_window(src);
+    if (egl_surface_ == EGL_NO_SURFACE) {
+        return Status::fail("present: window surface unavailable");
     }
 
-    Status st = present_image(src);
-    if (st.ok) return st;
-
-    if (!st.retryable && cfg_.allow_window_fallback) {
-        // Some vendor PRIVATE layouts reject EGLImage binding. An EGLSurface
-        // still works, so switch once and stay there.
-        LOGW("EGLImage path failed (%s), switching to window surface",
-             st.message.c_str());
-        mode_ = Mode::kWindowSurface;
-        return present_window(src);
+    Status st = draw(src.texture());
+    if (!st) {
+        ++stats_.errors;
+        return st;
     }
-    return st;
+
+    if (eglSwapBuffers(egl_->display(), egl_surface_) != EGL_TRUE) {
+        ++stats_.dropped;
+        return Status::drop("eglSwapBuffers failed " +
+                            hex32(static_cast<uint32_t>(eglGetError())));
+    }
+
+    ++stats_.presented;
+    return Status::success();
 }
 
 }  // namespace vcam
@@ -1249,7 +948,6 @@ void worker_main(Session* s) {
     SurfaceSink::Config sink_cfg{};
     sink_cfg.matrix = s->matrix;
     sink_cfg.limited_range = s->limited;
-    sink_cfg.dequeue_timeout = std::chrono::milliseconds(16);
 
     auto sink = SurfaceSink::create(s->window, egl.get(), sink_cfg, &st);
     if (!sink) {
