@@ -10,9 +10,9 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GLES3/gl3.h>
 #define GL_GLEXT_PROTOTYPES 1
 #include <GLES2/gl2ext.h>
-#include <GLES3/gl3.h>
 
 #include <algorithm>
 #include <atomic>
