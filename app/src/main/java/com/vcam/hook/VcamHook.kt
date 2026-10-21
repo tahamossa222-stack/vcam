@@ -158,7 +158,7 @@ class VcamHook : IXposedHookLoadPackage {
                         val slots = ArrayList<SlotRegistry.Slot>()
 
                         val rebuiltOutputs = ArrayList<OutputConfiguration>()
-                        for (output in config.outputSurfaces) {
+                        for (output in config.outputConfigurations) {
                             rebuiltOutputs.add(rewriteOutput(output, cm, slots) ?: output)
                         }
                         if (slots.isEmpty()) return
@@ -201,10 +201,14 @@ class VcamHook : IXposedHookLoadPackage {
         }
         if (!changed) return null
 
-        val copy = if (substitutes.size > 1) {
-            OutputConfiguration(substitutes)
-        } else {
-            OutputConfiguration(substitutes.first())
+        // The Collection<Surface> constructor is @SystemApi; build from one
+        // surface and add the rest through the public sharing API.
+        val copy = OutputConfiguration(substitutes.first())
+        if (substitutes.size > 1) {
+            runCatching { copy.enableSurfaceSharing() }
+            for (i in 1 until substitutes.size) {
+                runCatching { copy.addSurface(substitutes[i]) }
+            }
         }
 
         runCatching {
@@ -266,7 +270,14 @@ class VcamHook : IXposedHookLoadPackage {
                     if (param.throwable != null) return
                     runCatching {
                         val request = param.args[0] as? CaptureRequest ?: return
-                        for (surface in request.targets) {
+                        // CaptureRequest#getTargets() is @hide; the field is
+                        // stable across the versions we support.
+                        val targets = runCatching {
+                            XposedHelpers.getObjectField(request, "mSurfaceSet")
+                        }.getOrNull() as? Collection<*> ?: return
+
+                        for (element in targets) {
+                            val surface = element as? Surface ?: continue
                             val slot = SlotRegistry.bySubstitute(surface) ?: continue
                             SlotRegistry.arm(slot)
                         }
@@ -305,14 +316,6 @@ class VcamHook : IXposedHookLoadPackage {
                 }
             }
         })
-    }
-
-    private fun releaseSlotsOf(session: Any) {
-        @Suppress("UNCHECKED_CAST")
-        val slots = XposedHelpers.getAdditionalInstanceField(session, KEY_SLOTS)
-            as? List<SlotRegistry.Slot> ?: return
-        slots.forEach(SlotRegistry::release)
-        XposedHelpers.removeAdditionalInstanceField(session, KEY_SLOTS)
     }
 
     private fun hookOpenCamera(cl: ClassLoader) {
@@ -384,6 +387,15 @@ class VcamHook : IXposedHookLoadPackage {
     companion object {
         const val MODULE_PACKAGE = "com.vcam.hook"
         const val KEY_SLOTS = "vcam.slots"
+
+        @JvmStatic
+        private fun releaseSlotsOf(session: Any) {
+            @Suppress("UNCHECKED_CAST")
+            val slots = XposedHelpers.getAdditionalInstanceField(session, KEY_SLOTS)
+                as? List<SlotRegistry.Slot> ?: return
+            slots.forEach(SlotRegistry::release)
+            XposedHelpers.removeAdditionalInstanceField(session, KEY_SLOTS)
+        }
     }
 }
 
@@ -543,7 +555,7 @@ internal object SlotRegistry {
 
     private fun createReader(width: Int, height: Int): ImageReader? {
         val usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or
-                    HardwareBuffer.USAGE_GPU_FRAMEBUFFER
+                    HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
 
         // The 5-arg overload is @SystemApi; it is the only way to request GPU
         // usage on a PRIVATE reader. Fall back to the public 4-arg form.
