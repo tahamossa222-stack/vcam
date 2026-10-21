@@ -47,4 +47,5 @@ class SandboxEnv(
         height: Int,
         mime: String = "video/avc",
         fps: Int = 30,
-    ): EncodedCamera? = MediaCodecProxy.createEncoder(width, height, mime, fps = fps)}
+    ): EncodedCamera? = MediaCodecProxy.createEncoder(width, height, mime, fps = fps)
+}
