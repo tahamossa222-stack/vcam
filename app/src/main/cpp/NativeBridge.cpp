@@ -846,6 +846,8 @@ using vcam::Status;
 using vcam::SurfaceSink;
 using vcam::YuvMatrix;
 
+JavaVM* g_vm = nullptr;
+
 constexpr const char* kBridgeClass = "com/vcam/core/NativeBridge";
 constexpr int kDefaultFps = 30;
 constexpr int kMaxFps = 120;
@@ -856,6 +858,8 @@ int64_t now_boottime_ns() {
     clock_gettime(CLOCK_BOOTTIME, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
 }
+
+class SourceRenderer;
 
 struct Session {
     ANativeWindow* window = nullptr;
@@ -871,6 +875,8 @@ struct Session {
     std::atomic<uint64_t> presented{0};
     std::atomic<uint64_t> dropped{0};
     std::atomic<uint64_t> errors{0};
+    std::atomic<int> source_mode{0};
+    std::atomic<SourceRenderer*> renderer{nullptr};
     std::promise<bool> ready;
 };
 
@@ -916,6 +922,592 @@ void draw_test_pattern(int width, int height, uint64_t frame) {
     glDisable(GL_SCISSOR_TEST);
 }
 
+// ---------------------------------------------------------------------------
+// SourceRenderer
+//
+// Four feed modes share one fragment stage:
+//   kVideo  surface produced by MediaCodec, sampled as an external OES
+//           texture; the decoder writes YUV and EGL converts on sampling,
+//           so no pixel data crosses the CPU
+//   kImage  RGBA still, uploaded once per selection
+//   kNv21   raw camera-style planes, uploaded and converted in the shader
+//   kTest   synthetic pattern used when no media is selected
+// ---------------------------------------------------------------------------
+
+class SourceRenderer {
+public:
+    enum Mode : int { kTest = 0, kVideo = 1, kImage = 2, kNv21 = 3 };
+
+    bool init(JavaVM* vm, Status* st);
+    void release();
+
+    jobject video_surface() const { return video_surface_; }
+
+    void push_rgba(const uint8_t* data, int width, int height);
+    void push_nv21(const uint8_t* data, int width, int height);
+    void set_source_size(int width, int height) {
+        src_w_.store(width, std::memory_order_relaxed);
+        src_h_.store(height, std::memory_order_relaxed);
+    }
+
+    void draw(int fbo, int width, int height, int mode, uint64_t frame);
+
+private:
+    bool build_programs(Status* st);
+    GLuint compile(GLenum type, const char* source, Status* st);
+    GLuint link(const char* vs, const char* fs, Status* st);
+
+    void draw_video(int fbo, int w, int h);
+    void draw_image(int fbo, int w, int h);
+    void draw_nv21(int fbo, int w, int h);
+
+    void upload_image();
+    void upload_nv21();
+    void aspect_scale(int target_w, int target_h, float out[2]) const;
+
+    JavaVM* vm_ = nullptr;
+    bool attached_ = false;
+    JNIEnv* env_ = nullptr;
+    jobject surface_texture_ = nullptr;
+    jobject video_surface_ = nullptr;
+    jfloatArray transform_array_ = nullptr;
+    jmethodID update_tex_ = nullptr;
+    jmethodID get_transform_ = nullptr;
+    float transform_[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+
+    GLuint prog_ext_ = 0;
+    GLuint prog_img_ = 0;
+    GLuint prog_nv21_ = 0;
+
+    GLint u_ext_tex_ = -1;
+    GLint u_ext_xform_ = -1;
+    GLint u_ext_scale_ = -1;
+    GLint u_img_tex_ = -1;
+    GLint u_img_flip_ = -1;
+    GLint u_img_scale_ = -1;
+    GLint u_nv_y_ = -1;
+    GLint u_nv_uv_ = -1;
+    GLint u_nv_flip_ = -1;
+    GLint u_nv_scale_ = -1;
+
+    GLuint ext_tex_ = 0;
+    GLuint img_tex_ = 0;
+    GLuint y_tex_ = 0;
+    GLuint uv_tex_ = 0;
+
+    std::mutex pending_mutex_;
+    std::vector<uint8_t> pending_rgba_;
+    int pending_rgba_w_ = 0;
+    int pending_rgba_h_ = 0;
+    std::atomic<uint64_t> rgba_seq_{0};
+    uint64_t rgba_drawn_ = 0;
+
+    std::vector<uint8_t> pending_nv21_;
+    int pending_nv21_w_ = 0;
+    int pending_nv21_h_ = 0;
+    std::atomic<uint64_t> nv21_seq_{0};
+    uint64_t nv21_drawn_ = 0;
+
+    std::atomic<int> src_w_{0};
+    std::atomic<int> src_h_{0};
+
+    int img_w_ = 0;
+    int img_h_ = 0;
+    int nv_w_ = 0;
+    int nv_h_ = 0;
+    bool has_image_ = false;
+    bool has_nv21_ = false;
+};
+
+namespace {
+
+constexpr char kSourceVs[] = R"glsl(
+#version 300 es
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    v_uv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)glsl";
+
+constexpr char kExternalFs[] = R"glsl(
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision mediump float;
+uniform samplerExternalOES u_tex;
+uniform mat4 u_transform;
+uniform vec2 u_uv_scale;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    vec2 suv = (v_uv - 0.5) * u_uv_scale + 0.5;
+    frag = texture(u_tex, (u_transform * vec4(suv, 0.0, 1.0)).xy);
+}
+)glsl";
+
+constexpr char kImageFs[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D u_tex;
+uniform float u_flip;
+uniform vec2 u_uv_scale;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    vec2 suv = (v_uv - 0.5) * u_uv_scale + 0.5;
+    vec2 uv = vec2(suv.x, mix(suv.y, 1.0 - suv.y, u_flip));
+    frag = vec4(texture(u_tex, uv).rgb, 1.0);
+}
+)glsl";
+
+constexpr char kNv21Fs[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D u_y;
+uniform sampler2D u_uv;
+uniform float u_flip;
+uniform vec2 u_uv_scale;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    vec2 suv = (v_uv - 0.5) * u_uv_scale + 0.5;
+    vec2 uv = vec2(suv.x, mix(suv.y, 1.0 - suv.y, u_flip));
+    float y = texture(u_y, uv).r;
+    vec2 c = texture(u_uv, uv).rg;
+    // NV21 stores V then U, BT.709 limited range.
+    float v = c.r - 0.5;
+    float u = c.g - 0.5;
+    float luma = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    vec3 rgb = vec3(
+        luma + 1.5748 * v,
+        luma - 0.1873 * u - 0.4681 * v,
+        luma + 1.8556 * u);
+    frag = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+)glsl";
+
+}  // namespace
+
+bool SourceRenderer::init(JavaVM* vm, Status* st) {
+    if (!build_programs(st)) return false;
+
+    if (vm == nullptr) {
+        LOGW("no JavaVM: video source disabled");
+        return true;
+    }
+
+    vm_ = vm;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env_), JNI_VERSION_1_6) != JNI_OK) {
+        if (vm->AttachCurrentThread(&env_, nullptr) != JNI_OK) {
+            env_ = nullptr;
+            vm_ = nullptr;
+            LOGW("AttachCurrentThread failed: video source disabled");
+            return true;
+        }
+        attached_ = true;
+    }
+
+    glGenTextures(1, &ext_tex_);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, ext_tex_);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+    jclass st_cls = env_->FindClass("android/graphics/SurfaceTexture");
+    if (st_cls == nullptr || env_->ExceptionCheck()) {
+        env_->ExceptionClear();
+        LOGW("SurfaceTexture unavailable: video source disabled");
+        return true;
+    }
+
+    jmethodID ctor = env_->GetMethodID(st_cls, "<init>", "(I)V");
+    if (ctor == nullptr) {
+        env_->ExceptionClear();
+        LOGW("SurfaceTexture constructor unavailable");
+        return true;
+    }
+    jobject st_obj = env_->NewObject(st_cls, ctor, static_cast<jint>(ext_tex_));
+    if (st_obj == nullptr || env_->ExceptionCheck()) {
+        env_->ExceptionClear();
+        LOGW("SurfaceTexture construction failed");
+        return true;
+    }
+
+    jclass surf_cls = env_->FindClass("android/view/Surface");
+    if (surf_cls == nullptr || env_->ExceptionCheck()) {
+        env_->ExceptionClear();
+        LOGW("Surface class unavailable");
+        return true;
+    }
+    jmethodID surf_ctor = env_->GetMethodID(
+        surf_cls, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
+    if (surf_ctor == nullptr) {
+        env_->ExceptionClear();
+        LOGW("Surface constructor unavailable");
+        return true;
+    }
+    jobject surf = env_->NewObject(surf_cls, surf_ctor, st_obj);
+    if (surf == nullptr || env_->ExceptionCheck()) {
+        env_->ExceptionClear();
+        LOGW("Surface construction failed");
+        return true;
+    }
+
+    update_tex_ = env_->GetMethodID(st_cls, "updateTexImage", "()V");
+    get_transform_ = env_->GetMethodID(st_cls, "getTransformMatrix", "([F)V");
+
+    jfloatArray local_transform = env_->NewFloatArray(16);
+    if (local_transform == nullptr || update_tex_ == nullptr || get_transform_ == nullptr) {
+        env_->ExceptionClear();
+        LOGW("SurfaceTexture methods unavailable");
+        return true;
+    }
+    transform_array_ = static_cast<jfloatArray>(env_->NewGlobalRef(local_transform));
+    surface_texture_ = env_->NewGlobalRef(st_obj);
+    video_surface_ = env_->NewGlobalRef(surf);
+
+    LOGI("video source surface ready tex=%u", ext_tex_);
+    return true;
+}
+
+void SourceRenderer::release() {
+    if (env_ != nullptr) {
+        if (video_surface_ != nullptr) {
+            jclass cls = env_->GetObjectClass(video_surface_);
+            jmethodID rel = env_->GetMethodID(cls, "release", "()V");
+            if (rel != nullptr) env_->CallVoidMethod(video_surface_, rel);
+            if (env_->ExceptionCheck()) env_->ExceptionClear();
+            env_->DeleteGlobalRef(video_surface_);
+            video_surface_ = nullptr;
+        }
+        if (surface_texture_ != nullptr) {
+            jclass cls = env_->GetObjectClass(surface_texture_);
+            jmethodID rel = env_->GetMethodID(cls, "release", "()V");
+            if (rel != nullptr) env_->CallVoidMethod(surface_texture_, rel);
+            if (env_->ExceptionCheck()) env_->ExceptionClear();
+            env_->DeleteGlobalRef(surface_texture_);
+            surface_texture_ = nullptr;
+        }
+        if (transform_array_ != nullptr) {
+            env_->DeleteGlobalRef(transform_array_);
+            transform_array_ = nullptr;
+        }
+    }
+
+    if (prog_ext_ != 0) glDeleteProgram(prog_ext_);
+    if (prog_img_ != 0) glDeleteProgram(prog_img_);
+    if (prog_nv21_ != 0) glDeleteProgram(prog_nv21_);
+    prog_ext_ = prog_img_ = prog_nv21_ = 0;
+
+    GLuint textures[] = {ext_tex_, img_tex_, y_tex_, uv_tex_};
+    glDeleteTextures(4, textures);
+    ext_tex_ = img_tex_ = y_tex_ = uv_tex_ = 0;
+
+    if (attached_ && vm_ != nullptr) {
+        vm_->DetachCurrentThread();
+    }
+    attached_ = false;
+    vm_ = nullptr;
+    env_ = nullptr;
+}
+
+bool SourceRenderer::build_programs(Status* st) {
+    prog_ext_ = link(kSourceVs, kExternalFs, st);
+    if (prog_ext_ == 0) {
+        LOGW("external OES program unavailable: %s", st->message.c_str());
+    } else {
+        u_ext_tex_ = glGetUniformLocation(prog_ext_, "u_tex");
+        u_ext_xform_ = glGetUniformLocation(prog_ext_, "u_transform");
+        u_ext_scale_ = glGetUniformLocation(prog_ext_, "u_uv_scale");
+    }
+
+    prog_img_ = link(kSourceVs, kImageFs, st);
+    if (prog_img_ == 0) return false;
+    u_img_tex_ = glGetUniformLocation(prog_img_, "u_tex");
+    u_img_flip_ = glGetUniformLocation(prog_img_, "u_flip");
+    u_img_scale_ = glGetUniformLocation(prog_img_, "u_uv_scale");
+
+    prog_nv21_ = link(kSourceVs, kNv21Fs, st);
+    if (prog_nv21_ == 0) return false;
+    u_nv_y_ = glGetUniformLocation(prog_nv21_, "u_y");
+    u_nv_uv_ = glGetUniformLocation(prog_nv21_, "u_uv");
+    u_nv_flip_ = glGetUniformLocation(prog_nv21_, "u_flip");
+    u_nv_scale_ = glGetUniformLocation(prog_nv21_, "u_uv_scale");
+
+    return true;
+}
+
+GLuint SourceRenderer::compile(GLenum type, const char* source, Status* st) {
+    const GLuint shader = glCreateShader(type);
+    if (shader == 0) {
+        *st = Status::fail("source: glCreateShader failed");
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+        GLint len = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &len);
+        std::string log(static_cast<std::size_t>(len > 1 ? len : 1), '\0');
+        if (len > 1) glGetShaderInfoLog(shader, len, nullptr, log.data());
+        glDeleteShader(shader);
+        *st = Status::fail("source shader: " + log);
+        return 0;
+    }
+    return shader;
+}
+
+GLuint SourceRenderer::link(const char* vs, const char* fs, Status* st) {
+    Status local{};
+    const GLuint v = compile(GL_VERTEX_SHADER, vs, &local);
+    if (v == 0) {
+        *st = local;
+        return 0;
+    }
+    const GLuint f = compile(GL_FRAGMENT_SHADER, fs, &local);
+    if (f == 0) {
+        glDeleteShader(v);
+        *st = local;
+        return 0;
+    }
+
+    const GLuint prog = glCreateProgram();
+    glAttachShader(prog, v);
+    glAttachShader(prog, f);
+    glLinkProgram(prog);
+    glDeleteShader(v);
+    glDeleteShader(f);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        std::string log(static_cast<std::size_t>(len > 1 ? len : 1), '\0');
+        if (len > 1) glGetProgramInfoLog(prog, len, nullptr, log.data());
+        glDeleteProgram(prog);
+        *st = Status::fail("source link: " + log);
+        return 0;
+    }
+    return prog;
+}
+
+void SourceRenderer::aspect_scale(int target_w, int target_h, float out[2]) const {
+    out[0] = 1.0f;
+    out[1] = 1.0f;
+
+    const int sw = src_w_.load(std::memory_order_relaxed);
+    const int sh = src_h_.load(std::memory_order_relaxed);
+    if (sw <= 0 || sh <= 0 || target_w <= 0 || target_h <= 0) return;
+
+    const float source_aspect = static_cast<float>(sw) / static_cast<float>(sh);
+    const float target_aspect = static_cast<float>(target_w) / static_cast<float>(target_h);
+
+    // Center-crop: keep the source aspect and let the overflow clip.
+    if (source_aspect > target_aspect) {
+        out[0] = target_aspect / source_aspect;
+    } else {
+        out[1] = source_aspect / target_aspect;
+    }
+}
+
+void SourceRenderer::push_rgba(const uint8_t* data, int width, int height) {
+    if (data == nullptr || width <= 0 || height <= 0) return;
+    const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;
+
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_rgba_.size() != bytes) pending_rgba_.resize(bytes);
+    std::memcpy(pending_rgba_.data(), data, bytes);
+    pending_rgba_w_ = width;
+    pending_rgba_h_ = height;
+    rgba_seq_.fetch_add(1, std::memory_order_release);
+}
+
+void SourceRenderer::push_nv21(const uint8_t* data, int width, int height) {
+    if (data == nullptr || width <= 0 || height <= 0) return;
+    const std::size_t bytes =
+        static_cast<std::size_t>(width) * height + static_cast<std::size_t>(width) * height / 2;
+
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_nv21_.size() != bytes) pending_nv21_.resize(bytes);
+    std::memcpy(pending_nv21_.data(), data, bytes);
+    pending_nv21_w_ = width;
+    pending_nv21_h_ = height;
+    nv21_seq_.fetch_add(1, std::memory_order_release);
+}
+
+void SourceRenderer::upload_image() {
+    if (rgba_seq_.load(std::memory_order_acquire) == rgba_drawn_) return;
+
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_rgba_.empty()) return;
+
+    if (!has_image_ || img_w_ != pending_rgba_w_ || img_h_ != pending_rgba_h_) {
+        img_w_ = pending_rgba_w_;
+        img_h_ = pending_rgba_h_;
+        glBindTexture(GL_TEXTURE_2D, img_tex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img_w_, img_h_, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        has_image_ = true;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, img_tex_);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img_w_, img_h_,
+                    GL_RGBA, GL_UNSIGNED_BYTE, pending_rgba_.data());
+    rgba_drawn_ = rgba_seq_.load(std::memory_order_acquire);
+}
+
+void SourceRenderer::upload_nv21() {
+    if (nv21_seq_.load(std::memory_order_acquire) == nv21_drawn_) return;
+
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_nv21_.empty()) return;
+
+    const int w = pending_nv21_w_;
+    const int h = pending_nv21_h_;
+
+    if (!has_nv21_ || nv_w_ != w || nv_h_ != h) {
+        nv_w_ = w;
+        nv_h_ = h;
+
+        glBindTexture(GL_TEXTURE_2D, y_tex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0,
+                     GL_RED, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindTexture(GL_TEXTURE_2D, uv_tex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, w / 2, h / 2, 0,
+                     GL_RG, GL_UNSIGNED_BYTE, nullptr);
+        has_nv21_ = true;
+    }
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D, y_tex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                    GL_RED, GL_UNSIGNED_BYTE, pending_nv21_.data());
+
+    glBindTexture(GL_TEXTURE_2D, uv_tex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w / 2, h / 2,
+                    GL_RG, GL_UNSIGNED_BYTE, pending_nv21_.data() + w * h);
+
+    nv21_drawn_ = nv21_seq_.load(std::memory_order_acquire);
+}
+
+void SourceRenderer::draw_video(int fbo, int w, int h) {
+    if (env_ == nullptr || surface_texture_ == nullptr || prog_ext_ == 0 ||
+        update_tex_ == nullptr || get_transform_ == nullptr || transform_array_ == nullptr) {
+        draw_test_pattern(w, h, 0);
+        return;
+    }
+
+    env_->CallVoidMethod(surface_texture_, update_tex_);
+    const bool fresh = env_->ExceptionCheck() == JNI_FALSE;
+    if (!fresh) env_->ExceptionClear();
+
+    env_->CallVoidMethod(surface_texture_, get_transform_, transform_array_);
+    if (env_->ExceptionCheck() != JNI_FALSE) {
+        env_->ExceptionClear();
+    } else if (fresh) {
+        env_->GetFloatArrayRegion(transform_array_, 0, 16, transform_);
+    }
+
+    float scale[2];
+    aspect_scale(w, h, scale);
+
+    glUseProgram(prog_ext_);
+    glUniform1i(u_ext_tex_, 0);
+    glUniform2f(u_ext_scale_, scale[0], scale[1]);
+    glUniformMatrix4fv(u_ext_xform_, 1, GL_FALSE, transform_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, ext_tex_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+void SourceRenderer::draw_image(int fbo, int w, int h) {
+    upload_image();
+    if (!has_image_ || prog_img_ == 0) {
+        draw_test_pattern(w, h, 0);
+        return;
+    }
+
+    float scale[2];
+    aspect_scale(w, h, scale);
+
+    glUseProgram(prog_img_);
+    glUniform1i(u_img_tex_, 0);
+    glUniform1f(u_img_flip_, 1.0f);
+    glUniform2f(u_img_scale_, scale[0], scale[1]);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, img_tex_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+void SourceRenderer::draw_nv21(int fbo, int w, int h) {
+    upload_nv21();
+    if (!has_nv21_ || prog_nv21_ == 0) {
+        draw_test_pattern(w, h, 0);
+        return;
+    }
+
+    float scale[2];
+    aspect_scale(w, h, scale);
+
+    glUseProgram(prog_nv21_);
+    glUniform1i(u_nv_y_, 0);
+    glUniform1i(u_nv_uv_, 1);
+    glUniform1f(u_nv_flip_, 1.0f);
+    glUniform2f(u_nv_scale_, scale[0], scale[1]);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, y_tex_);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, uv_tex_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+void SourceRenderer::draw(int fbo, int width, int height, int mode, uint64_t frame) {
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, width, height);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    switch (mode) {
+        case kVideo: draw_video(fbo, width, height); break;
+        case kImage: draw_image(fbo, width, height); break;
+        case kNv21: draw_nv21(fbo, width, height); break;
+        default: draw_test_pattern(width, height, frame); break;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 void worker_main(Session* s) {
     Status st{};
 
@@ -958,6 +1550,14 @@ void worker_main(Session* s) {
         return;
     }
 
+    SourceRenderer source;
+    if (!source.init(g_vm, &st)) {
+        LOGE("SourceRenderer: %s", st.message.c_str());
+        s->ready.set_value(false);
+        return;
+    }
+    s->renderer.store(&source, std::memory_order_release);
+
     s->ready.set_value(true);
 
     int64_t next_due = now_boottime_ns();
@@ -983,9 +1583,8 @@ void worker_main(Session* s) {
         if (!slot) {
             s->dropped.fetch_add(1, std::memory_order_relaxed);
         } else {
-            glBindFramebuffer(GL_FRAMEBUFFER, slot.fbo());
-            draw_test_pattern(s->width, s->height, frame);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            const int mode = s->source_mode.load(std::memory_order_relaxed);
+            source.draw(slot.fbo(), s->width, s->height, mode, frame);
             slot.set_pts_ns(now_boottime_ns());
 
             const Status presented = sink->present(slot);
@@ -1011,6 +1610,8 @@ void worker_main(Session* s) {
         }
     }
 
+    s->renderer.store(nullptr, std::memory_order_release);
+    source.release();
     sink.reset();
     ring.reset();
     egl->clear_current();
@@ -1133,6 +1734,67 @@ void j_set_fps(JNIEnv*, jclass, jlong handle, jint fps) {
     s->fps.store(std::clamp<int>(fps, 1, kMaxFps), std::memory_order_relaxed);
 }
 
+jobject j_video_surface(JNIEnv* env, jclass, jlong handle) {
+    Session* s = from_handle(handle);
+    if (s == nullptr) return nullptr;
+
+    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
+    if (r == nullptr) return nullptr;
+
+    jobject global = r->video_surface();
+    return (global != nullptr) ? env->NewLocalRef(global) : nullptr;
+}
+
+void j_set_source(JNIEnv*, jclass, jlong handle, jint mode) {
+    Session* s = from_handle(handle);
+    if (s == nullptr) return;
+    s->source_mode.store(std::clamp<int>(mode, 0, 3), std::memory_order_relaxed);
+}
+
+void j_set_source_size(JNIEnv*, jclass, jlong handle, jint width, jint height) {
+    Session* s = from_handle(handle);
+    if (s == nullptr) return;
+
+    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
+    if (r == nullptr) return;
+
+    r->set_source_size(width, height);
+}
+
+void j_push_image(JNIEnv* env, jclass, jlong handle, jobject buffer, jint width, jint height) {
+    Session* s = from_handle(handle);
+    if (s == nullptr || buffer == nullptr) return;
+
+    const jlong capacity = env->GetDirectBufferCapacity(buffer);
+    const jlong required = static_cast<jlong>(width) * height * 4;
+    if (capacity < required || required <= 0) return;
+
+    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
+    if (r == nullptr) return;
+
+    auto* data = static_cast<const uint8_t*>(env->GetDirectBufferAddress(buffer));
+    if (data == nullptr) return;
+
+    r->push_rgba(data, width, height);
+}
+
+void j_push_nv21(JNIEnv* env, jclass, jlong handle, jobject buffer, jint width, jint height) {
+    Session* s = from_handle(handle);
+    if (s == nullptr || buffer == nullptr) return;
+
+    const jlong capacity = env->GetDirectBufferCapacity(buffer);
+    const jlong required = static_cast<jlong>(width) * height * 3 / 2;
+    if (capacity < required || required <= 0) return;
+
+    SourceRenderer* r = s->renderer.load(std::memory_order_acquire);
+    if (r == nullptr) return;
+
+    auto* data = static_cast<const uint8_t*>(env->GetDirectBufferAddress(buffer));
+    if (data == nullptr) return;
+
+    r->push_nv21(data, width, height);
+}
+
 const JNINativeMethod kMethods[] = {
     { "createSession",  "(Landroid/view/Surface;IIIZ)J", reinterpret_cast<void*>(j_create_session) },
     { "destroySession", "(J)V",                          reinterpret_cast<void*>(j_destroy_session) },
@@ -1140,6 +1802,11 @@ const JNINativeMethod kMethods[] = {
     { "surfaceSize",    "(Landroid/view/Surface;)[I",     reinterpret_cast<void*>(j_surface_size) },
     { "stats",          "(J)[J",                          reinterpret_cast<void*>(j_stats) },
     { "setFps",         "(JI)V",                          reinterpret_cast<void*>(j_set_fps) },
+    { "videoSurface",   "(J)Landroid/view/Surface;",      reinterpret_cast<void*>(j_video_surface) },
+    { "setSource",      "(JI)V",                          reinterpret_cast<void*>(j_set_source) },
+    { "setSourceSize",  "(JII)V",                         reinterpret_cast<void*>(j_set_source_size) },
+    { "pushImage",      "(JLjava/nio/ByteBuffer;II)V",    reinterpret_cast<void*>(j_push_image) },
+    { "pushNv21",       "(JLjava/nio/ByteBuffer;II)V",    reinterpret_cast<void*>(j_push_nv21) },
 };
 
 }  // namespace
@@ -1149,6 +1816,8 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
     }
+    g_vm = vm;
+
     jclass bridge = env->FindClass(kBridgeClass);
     if (bridge == nullptr) {
         LOGE("NativeBridge class not found");

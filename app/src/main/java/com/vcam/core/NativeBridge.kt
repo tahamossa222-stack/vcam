@@ -2,6 +2,7 @@
 package com.vcam.core
 
 import android.view.Surface
+import java.nio.ByteBuffer
 
 /**
  * Allocation-free binding to libvcam_hook. Every method tolerates handle 0;
@@ -16,6 +17,11 @@ internal object NativeBridge {
     const val MATRIX_BT601 = 0
     const val MATRIX_BT709 = 1
     const val MATRIX_BT2020 = 2
+
+    const val SOURCE_TEST = 0
+    const val SOURCE_VIDEO = 1
+    const val SOURCE_IMAGE = 2
+    const val SOURCE_NV21 = 3
 
     /**
      * Spins the EGL render thread for [surface]. The sink starts disarmed and
@@ -41,4 +47,18 @@ internal object NativeBridge {
     external fun stats(handle: Long): LongArray
 
     external fun setFps(handle: Long, fps: Int)
+
+    /** Decoder input surface backed by the session's external OES texture. */
+    external fun videoSurface(handle: Long): Surface?
+
+    external fun setSource(handle: Long, mode: Int)
+
+    /** Intrinsic size of the feed, used for center-crop scaling. */
+    external fun setSourceSize(handle: Long, width: Int, height: Int)
+
+    /** RGBA8888, tightly packed, direct buffer. */
+    external fun pushImage(handle: Long, rgba: ByteBuffer, width: Int, height: Int)
+
+    /** NV21, tightly packed, direct buffer. */
+    external fun pushNv21(handle: Long, data: ByteBuffer, width: Int, height: Int)
 }

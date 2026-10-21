@@ -3,6 +3,7 @@ package com.vcam.core
 
 import android.util.Log
 import android.view.Surface
+import java.nio.ByteBuffer
 
 /**
  * A live render session writing composited frames into [surface].
@@ -34,6 +35,30 @@ class VirtualCamera internal constructor(
 
     fun resume() {
         if (!closed && handle != 0L) NativeBridge.setActive(handle, true)
+    }
+
+    /**
+     * Surface a MediaCodec decoder can render into. Frames never touch the
+     * CPU: the decoder writes into the BufferQueue and the sink samples the
+     * external texture.
+     */
+    fun videoSurface(): Surface? =
+        if (closed || handle == 0L) null else NativeBridge.videoSurface(handle)
+
+    fun setSource(mode: Int) {
+        if (!closed && handle != 0L) NativeBridge.setSource(handle, mode)
+    }
+
+    fun setSourceSize(width: Int, height: Int) {
+        if (!closed && handle != 0L) NativeBridge.setSourceSize(handle, width, height)
+    }
+
+    fun pushImage(rgba: ByteBuffer, width: Int, height: Int) {
+        if (!closed && handle != 0L) NativeBridge.pushImage(handle, rgba, width, height)
+    }
+
+    fun pushNv21(data: ByteBuffer, width: Int, height: Int) {
+        if (!closed && handle != 0L) NativeBridge.pushNv21(handle, data, width, height)
     }
 
     override fun close() {

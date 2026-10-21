@@ -7,6 +7,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -45,22 +48,41 @@ jobs:
       - name: Assemble release
         run: gradle --no-daemon :app:assembleRelease
 
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/vcam-modern-release.apk
+          sha256sum dist/vcam-modern-release.apk
+
       - name: Verify 16 KB alignment
         run: |
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          "$BT/zipalign" -c -P 16 -v 4 \
-            app/build/outputs/apk/release/app-release.apk
+          "$BT/zipalign" -c -P 16 -v 4 dist/vcam-modern-release.apk
+          "$ANDROID_HOME/ndk/28.0.13004108/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -lW app/build/intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib/arm64-v8a/libvcam_hook.so \
+            | grep -E '^\s+LOAD' || true
 
       - name: Signature
         run: |
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          "$BT/apksigner" verify --print-certs \
-            app/build/outputs/apk/release/app-release.apk
+          "$BT/apksigner" verify --print-certs dist/vcam-modern-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vcam-sandbox-release
-          path: app/build/outputs/apk/release/app-release.apk
+          name: vcam-modern-release
+          path: dist/vcam-modern-release.apk
           retention-days: 30
           if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=vcam-modern-v3.0
+          gh release view "$TAG" > /dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "VCam Modern 3.0" \
+              --notes "Non-root virtual camera: native EGL/GLES3 sink, MediaCodec video feed, GPU NV21 conversion, in-app media selector. arm64-v8a, Android 11-15, 16 KB aligned."
+          gh release upload "$TAG" dist/vcam-modern-release.apk --clobber
