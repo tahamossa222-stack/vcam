@@ -670,11 +670,9 @@ bool SurfaceSink::init(EglCore* egl, Status* st) {
 
     if (!build_program(st)) return false;
 
-    const EGLint attribs[] = {
-        EGL_SWAP_BEHAVIOR, EGL_BUFFER_DESTROYED,
-        EGL_NONE,
-    };
-    egl_surface_ = eglCreateWindowSurface(egl_->display(), egl_->config(), window_, attribs);
+    // Default swap behaviour is already EGL_BUFFER_DESTROYED; passing it as a
+    // creation attribute is not portable across vendor EGL implementations.
+    egl_surface_ = eglCreateWindowSurface(egl_->display(), egl_->config(), window_, nullptr);
     if (egl_surface_ == EGL_NO_SURFACE) {
         *st = Status::fail("eglCreateWindowSurface failed " +
                            hex32(static_cast<uint32_t>(eglGetError())));
