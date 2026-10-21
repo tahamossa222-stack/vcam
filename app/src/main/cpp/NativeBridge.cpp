@@ -10,7 +10,11 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+// Core GL types (GLenum, GLsizei, GLuint) must be visible before any
+// extension header is parsed. gl3.h pulls them in for the ES3 entry points,
+// gl2.h restates the ES2 set, and gl2ext.h is parsed last.
 #include <GLES3/gl3.h>
+#include <GLES2/gl2.h>
 #define GL_GLEXT_PROTOTYPES 1
 #include <GLES2/gl2ext.h>
 
